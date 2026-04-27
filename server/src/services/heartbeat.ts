@@ -145,6 +145,7 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const SPAWN_NOT_STARTED_ERROR_CODE = "spawn_not_started";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -1873,6 +1874,28 @@ function buildProcessLossMessage(run: {
     return `Process lost -- process group ${run.processGroupId} is no longer running`;
   }
   return "Process lost -- server may have restarted";
+}
+
+function hasNoPersistedExecutionMetadata(run: {
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt?: Date | string | null;
+  logStore?: string | null;
+  logRef?: string | null;
+  stdoutExcerpt?: string | null;
+  stderrExcerpt?: string | null;
+}) {
+  return !run.processPid &&
+    !run.processGroupId &&
+    !run.processStartedAt &&
+    !run.logStore &&
+    !run.logRef &&
+    !run.stdoutExcerpt &&
+    !run.stderrExcerpt;
+}
+
+function buildSpawnNotStartedMessage() {
+  return "No process or log metadata was persisted before the server lost this run; adapter spawn likely did not start";
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -4400,11 +4423,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const missingExecutionMetadata = tracksLocalChild && hasNoPersistedExecutionMetadata(run);
+      const baseMessage = missingExecutionMetadata
+        ? buildSpawnNotStartedMessage()
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const errorCode = missingExecutionMetadata ? SPAWN_NOT_STARTED_ERROR_CODE : "process_lost";
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode,
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },

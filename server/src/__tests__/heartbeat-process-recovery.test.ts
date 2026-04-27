@@ -914,6 +914,49 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
   });
 
+  it("classifies orphaned local runs with no process or log metadata as pre-spawn startup failures", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+
+    const failedRun = runs[0];
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("spawn_not_started");
+    expect(failedRun?.error).toContain("No process or log metadata was persisted");
+    expect(failedRun?.processPid).toBeNull();
+    expect(failedRun?.processGroupId).toBeNull();
+    expect(failedRun?.processStartedAt).toBeNull();
+    expect(failedRun?.logStore).toBeNull();
+    expect(failedRun?.logRef).toBeNull();
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events).toHaveLength(1);
+    expect(events[0]?.message).toContain("No process or log metadata was persisted");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+  });
+
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
     mockAdapterExecute.mockRejectedValueOnce(new Error("continuation recovery failed"));
 
