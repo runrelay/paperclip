@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -2631,9 +2631,8 @@ export function heartbeatService(db: Db) {
     const claimed = await db
       .update(heartbeatRuns)
       .set({
-        status: "running",
+        status: "starting",
         startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
       .returning()
@@ -2798,9 +2797,21 @@ export function heartbeatService(db: Db) {
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
+      // For non-local-child adapters (litellm_proxy, external API adapters):
+      // distinguish "adapter never started" from "process was lost".
+      // This avoids treating a pre-spawn lifecycle dropout as process_lost
+      // (PER-2753: LiteCoder-review assignment race).
+      let errorCode: string;
+      if (!tracksLocalChild && !run.processPid && !run.processGroupId) {
+        const hasLog = !!run.logStore && !!run.logRef;
+        errorCode = hasLog ? "adapter_not_completed" : "adapter_not_started";
+      } else {
+        errorCode = "process_lost";
+      }
+
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode,
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -2844,6 +2855,53 @@ export function heartbeatService(db: Db) {
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
+
+    // Reap stale 'starting' runs — runs that stayed in initialization too long
+    // (PER-2760: state machine for run lifecycle).
+    const STARTING_GRACE_MS = 60_000;
+    const staleStarting = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "starting"),
+          sql`${heartbeatRuns.updatedAt} < ${new Date(Date.now() - STARTING_GRACE_MS).toISOString()}`,
+        ),
+      );
+
+    for (const run of staleStarting) {
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+
+      const finalizedRun = await setRunStatus(run.id, "failed", {
+        error: "Run stayed in starting state for too long — initialization never completed",
+        errorCode: "start_timeout",
+        finishedAt: now,
+      });
+      if (!finalizedRun) continue;
+
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: now,
+        error: "start_timeout",
+      });
+
+      await releaseIssueExecutionAndPromote(finalizedRun);
+
+      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "error",
+        message: "start_timeout — initialization never completed",
+        payload: {
+          staleThresholdMs: STARTING_GRACE_MS,
+        },
+      });
+
+      await finalizeAgentStatus(run.agentId, "failed");
+      await startNextQueuedRunForAgent(run.agentId);
+      runningProcesses.delete(run.id);
+      reaped.push(run.id);
+    }
+
     return { reaped: reaped.length, runIds: reaped };
   }
 
@@ -3215,7 +3273,7 @@ export function heartbeatService(db: Db) {
   async function executeRun(runId: string) {
     let run = await getRun(runId);
     if (!run) return;
-    if (run.status !== "queued" && run.status !== "running") return;
+    if (run.status !== "queued" && run.status !== "starting" && run.status !== "running") return;
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
@@ -3719,14 +3777,9 @@ export function heartbeatService(db: Db) {
         });
       }
 
-      const currentRun = run;
-      await appendRunEvent(currentRun, seq++, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message: "run started",
-      });
-
+      // Persist log_ref before the run becomes reaper-visible, so the
+      // reaper never encounters a "running" run without any diagnostic
+      // metadata (PER-2753: LiteCoder-review process_lost race).
       handle = await runLogStore.begin({
         companyId: run.companyId,
         agentId: run.agentId,
@@ -3741,6 +3794,25 @@ export function heartbeatService(db: Db) {
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, runId));
+
+      // Transition from starting to running now that log is initialized
+      // (PER-2760: state machine for run lifecycle).
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", updatedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "starting")))
+        .returning()
+        .then((rows) => {
+          if (rows[0]) run = rows[0];
+        });
+
+      const currentRun = run;
+      await appendRunEvent(currentRun, seq++, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "run started",
+      });
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {

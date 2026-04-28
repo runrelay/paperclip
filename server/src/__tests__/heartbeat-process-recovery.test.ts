@@ -98,7 +98,7 @@ async function waitForRunToSettle(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const run = await heartbeat.getRun(runId);
-    if (!run || (run.status !== "queued" && run.status !== "running")) return run;
+    if (!run || (run.status !== "queued" && run.status !== "starting" && run.status !== "running")) return run;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
@@ -172,7 +172,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     cleanupPids.clear();
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-      if (runs.every((run) => run.status !== "queued" && run.status !== "running")) {
+      if (runs.every((run) => run.status !== "queued" && run.status !== "starting" && run.status !== "running")) {
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -219,7 +219,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedRunFixture(input?: {
     adapterType?: string;
     agentStatus?: "paused" | "idle" | "running";
-    runStatus?: "running" | "queued" | "failed";
+    runStatus?: "running" | "starting" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
@@ -648,6 +648,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried continuation");
     expect(comments[0]?.body).toContain("Latest retry failure: `process_lost` - run failed before issue advanced.");
+  });
+
+  it("fails a stale 'starting' run with start_timeout after the 60s grace period", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      runStatus: "starting",
+      includeIssue: false,
+      // updatedAt is seeded to 2026-03-19T00:00:00Z which is well past 60s ago
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("start_timeout");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
