@@ -1975,9 +1975,11 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  instanceId?: string;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const instanceId = readNonEmptyString(options.instanceId ?? process.env.PAPERCLIP_INSTANCE_ID);
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -3691,6 +3693,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      instanceId: readNonEmptyString(heartbeat.instanceId) ?? readNonEmptyString(heartbeat.affinityInstanceId),
     };
   }
 
@@ -3722,6 +3725,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return new Map<string, Awaited<ReturnType<typeof issuesSvc.getDependencyReadiness>>>();
     }
     return issuesSvc.listDependencyReadiness(companyId, issueIds);
+  }
+
+  function heartbeatInstanceAffinityMatches(policy: ReturnType<typeof parseHeartbeatPolicy>) {
+    return !policy.instanceId || !instanceId || policy.instanceId === instanceId;
   }
 
   async function countRunningRunsForAgent(agentId: string) {
@@ -4468,9 +4475,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.status, "queued"));
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      claimedRuns.push(...await startNextQueuedRunForAgent(agentId));
     }
+    return claimedRuns;
   }
 
   async function reconcileStrandedAssignedIssues() {
@@ -4579,6 +4588,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
+      if (!heartbeatInstanceAffinityMatches(policy)) {
+        logger.debug(
+          { agentId, instanceId, affinityInstanceId: policy.instanceId },
+          "skipping queued heartbeat runs for non-matching instance affinity",
+        );
+        return [];
+      }
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
@@ -6410,6 +6426,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (source === "timer" && !policy.enabled) {
       await writeSkippedRequest("heartbeat.disabled");
+      return null;
+    }
+    if (!heartbeatInstanceAffinityMatches(policy)) {
+      await writeSkippedRequest("heartbeat.instance_affinity.mismatch");
       return null;
     }
     if (source !== "timer" && !policy.wakeOnDemand) {
