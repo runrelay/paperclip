@@ -145,7 +145,8 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
-const SPAWN_NOT_STARTED_ERROR_CODE = "spawn_not_started";
+const ADAPTER_NOT_STARTED_ERROR_CODE = "adapter_not_started";
+const ADAPTER_NOT_COMPLETED_ERROR_CODE = "adapter_not_completed";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -1894,8 +1895,12 @@ function hasNoPersistedExecutionMetadata(run: {
     !run.stderrExcerpt;
 }
 
-function buildSpawnNotStartedMessage() {
-  return "No process or log metadata was persisted before the server lost this run; adapter spawn likely did not start";
+function buildAdapterNotStartedMessage() {
+  return "Adapter/log initialization did not complete before the server lost this run; no process or log metadata was persisted";
+}
+
+function buildAdapterNotCompletedMessage() {
+  return "Adapter initialized logging but did not terminalize before the server lost this run";
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -4422,12 +4427,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const missingExecutionMetadata = tracksLocalChild && hasNoPersistedExecutionMetadata(run);
-      const baseMessage = missingExecutionMetadata
-        ? buildSpawnNotStartedMessage()
-        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
-      const errorCode = missingExecutionMetadata ? SPAWN_NOT_STARTED_ERROR_CODE : "process_lost";
+      const missingExecutionMetadata = hasNoPersistedExecutionMetadata(run);
+      const hasProcessEvidence = !!run.processPid || !!run.processGroupId;
+      const hasLogEvidence = !!run.logStore || !!run.logRef;
+      // Tactical PER-2753 classification until lifecycle_phase makes the
+      // initialization boundary explicit. Public heartbeat_runs.status stays
+      // unchanged; only diagnostic errorCode/message changes here.
+      const orphanError = missingExecutionMetadata
+        ? {
+          code: ADAPTER_NOT_STARTED_ERROR_CODE,
+          message: buildAdapterNotStartedMessage(),
+        }
+        : !tracksLocalChild && !hasProcessEvidence && hasLogEvidence
+        ? {
+          code: ADAPTER_NOT_COMPLETED_ERROR_CODE,
+          message: buildAdapterNotCompletedMessage(),
+        }
+        : {
+          code: "process_lost",
+          message: buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined),
+        };
+      const shouldRetry = orphanError.code === "process_lost" && tracksLocalChild && hasProcessEvidence && (run.processLossRetryCount ?? 0) < 1;
+      const baseMessage = orphanError.message;
+      const errorCode = orphanError.code;
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -4438,7 +4460,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "failed",
           {
             resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
+            errorCode,
             errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
           },
         ),
