@@ -33,14 +33,23 @@ function render(ui: ReactNode) {
   });
 }
 
+function lifecyclePhaseForStatus(status: HeartbeatRun["status"]): HeartbeatRun["lifecyclePhase"] {
+  if (status === "queued" || status === "running" || status === "succeeded") {
+    return status;
+  }
+  return "failed";
+}
+
 function createRun(overrides: Partial<HeartbeatRun> = {}): HeartbeatRun {
+  const status = overrides.status ?? "succeeded";
+
   return {
     id: "run-1",
     companyId: "company-1",
     agentId: "agent-1",
     invocationSource: "on_demand",
     triggerDetail: "manual",
-    status: "succeeded",
+    status,
     startedAt: new Date("2026-04-20T11:58:00.000Z"),
     finishedAt: new Date("2026-04-20T11:59:00.000Z"),
     error: null,
@@ -81,6 +90,7 @@ function createRun(overrides: Partial<HeartbeatRun> = {}): HeartbeatRun {
     createdAt: new Date("2026-04-20T11:58:00.000Z"),
     updatedAt: new Date("2026-04-20T11:59:00.000Z"),
     ...overrides,
+    lifecyclePhase: overrides.lifecyclePhase ?? lifecyclePhaseForStatus(status),
   };
 }
 

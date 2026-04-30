@@ -90,15 +90,23 @@ function daysAgo(days: number, hour = 12): Date {
   return date;
 }
 
+function lifecyclePhaseForStatus(status: HeartbeatRun["status"]): HeartbeatRun["lifecyclePhase"] {
+  if (status === "queued" || status === "running" || status === "succeeded") {
+    return status;
+  }
+  return "failed";
+}
+
 function makeHeartbeatRun(overrides: Partial<HeartbeatRun>): HeartbeatRun {
   const createdAt = overrides.createdAt ?? daysAgo(1);
+  const status = overrides.status ?? "succeeded";
   const run: HeartbeatRun = {
     id: "run-fixture",
     companyId,
     agentId: "agent-codex",
     invocationSource: "on_demand",
     triggerDetail: "manual",
-    status: "succeeded",
+    status,
     startedAt: createdAt,
     finishedAt: new Date(createdAt.getTime() + 11 * 60_000),
     error: null,
@@ -138,6 +146,7 @@ function makeHeartbeatRun(overrides: Partial<HeartbeatRun>): HeartbeatRun {
     nextAction: null,
     contextSnapshot: null,
     ...overrides,
+    lifecyclePhase: overrides.lifecyclePhase ?? lifecyclePhaseForStatus(status),
     createdAt,
     updatedAt: overrides.updatedAt ?? createdAt,
   };
