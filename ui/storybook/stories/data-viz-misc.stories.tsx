@@ -45,6 +45,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useDialog } from "@/context/DialogContext";
 import { queryKeys } from "@/lib/queryKeys";
+import { lifecyclePhaseForStatus } from "@/test-utils/heartbeat";
 import {
   createIssue,
   storybookAgents,
@@ -88,13 +89,6 @@ function daysAgo(days: number, hour = 12): Date {
   date.setHours(hour, 0, 0, 0);
   date.setDate(date.getDate() - days);
   return date;
-}
-
-function lifecyclePhaseForStatus(status: HeartbeatRun["status"]): HeartbeatRun["lifecyclePhase"] {
-  if (status === "queued" || status === "running" || status === "succeeded") {
-    return status;
-  }
-  return "failed";
 }
 
 function makeHeartbeatRun(overrides: Partial<HeartbeatRun>): HeartbeatRun {

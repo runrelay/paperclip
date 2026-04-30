@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { lifecyclePhaseForStatus } from "../test-utils/heartbeat";
 import { RunActivityChart, SuccessRateChart } from "./ActivityCharts";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -31,13 +32,6 @@ function render(ui: ReactNode) {
   act(() => {
     root.render(ui);
   });
-}
-
-function lifecyclePhaseForStatus(status: HeartbeatRun["status"]): HeartbeatRun["lifecyclePhase"] {
-  if (status === "queued" || status === "running" || status === "succeeded") {
-    return status;
-  }
-  return "failed";
 }
 
 function createRun(overrides: Partial<HeartbeatRun> = {}): HeartbeatRun {

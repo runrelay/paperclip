@@ -5467,7 +5467,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           lifecyclePhase: "running",
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, runId));
+        .where(and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.lifecyclePhase, "initializing"),
+        ));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
