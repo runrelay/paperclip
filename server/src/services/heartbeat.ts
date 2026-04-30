@@ -602,6 +602,7 @@ const heartbeatRunListColumns = {
   invocationSource: heartbeatRuns.invocationSource,
   triggerDetail: heartbeatRuns.triggerDetail,
   status: heartbeatRuns.status,
+  lifecyclePhase: heartbeatRuns.lifecyclePhase,
   startedAt: heartbeatRuns.startedAt,
   finishedAt: heartbeatRuns.finishedAt,
   error: heartbeatRuns.error,
@@ -2699,9 +2700,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const hasExplicitPhase = patch !== undefined && "lifecyclePhase" in patch;
+    let derivedPhase: string | undefined;
+    if (!hasExplicitPhase) {
+      if (status === "succeeded") derivedPhase = "succeeded";
+      else if (status === "failed" || status === "cancelled" || status === "timed_out") derivedPhase = "failed";
+      else if (status === "queued") derivedPhase = "queued";
+      // status === "running": intentionally no auto-set; preserves "initializing" until explicit boundary
+    }
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({
+        status,
+        ...(derivedPhase !== undefined ? { lifecyclePhase: derivedPhase } : {}),
+        ...patch,
+        updatedAt: new Date(),
+      })
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -3161,6 +3175,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: "automation",
           triggerDetail: "system",
           status: "queued",
+          lifecyclePhase: "queued",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
@@ -3368,6 +3383,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: "automation",
           triggerDetail: "system",
           status: "queued",
+          lifecyclePhase: "queued",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
@@ -3529,6 +3545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: "automation",
           triggerDetail: "system",
           status: "scheduled_retry",
+          lifecyclePhase: "queued",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
@@ -3630,6 +3647,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
+              lifecyclePhase: "failed",
               finishedAt: now,
               error: reason,
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
@@ -3696,6 +3714,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           status: "queued",
+          lifecyclePhase: "queued",
           updatedAt: now,
         })
         .where(
@@ -3872,6 +3891,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .update(heartbeatRuns)
       .set({
         status: "running",
+        lifecyclePhase: "initializing",
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
@@ -4418,6 +4438,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+
+      // Handle runs still in the initializing phase (claimed but not yet past logStore.begin)
+      if (run.lifecyclePhase === "initializing") {
+        const ageMs = now.getTime() - new Date(run.updatedAt).getTime();
+        if (ageMs <= 60_000) continue; // fresh initializing run – give it time to start
+        // Stale initializing: the run never completed initialization; fail it as start_timeout
+        let finalizedRun = await setRunStatus(run.id, "failed", {
+          error: "Run initialization timed out",
+          errorCode: "start_timeout",
+          finishedAt: now,
+        });
+        await setWakeupStatus(run.wakeupRequestId, "failed", {
+          finishedAt: now,
+          error: "Run initialization timed out",
+        });
+        if (!finalizedRun) finalizedRun = await getRun(run.id);
+        if (!finalizedRun) continue;
+        await releaseEnvironmentLeasesForRun({
+          runId: finalizedRun.id,
+          companyId: finalizedRun.companyId,
+          agentId: finalizedRun.agentId,
+          status: finalizedRun.status,
+          failureReason: finalizedRun.error ?? undefined,
+        });
+        await releaseIssueExecutionAndPromote(finalizedRun);
+        await finalizeAgentStatus(run.agentId, "failed");
+        await startNextQueuedRunForAgent(run.agentId);
+        runningProcesses.delete(run.id);
+        reaped.push(run.id);
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -5413,6 +5464,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           logStore: handle.store,
           logRef: handle.logRef,
+          lifecyclePhase: "running",
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, runId));
@@ -6186,6 +6238,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: promotedSource,
             triggerDetail: promotedTriggerDetail,
             status: "queued",
+            lifecyclePhase: "queued",
             wakeupRequestId: deferred.id,
             contextSnapshot: promotedContextSnapshot,
             sessionIdBefore: sessionBefore,
@@ -6307,6 +6360,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: "automation",
           triggerDetail: "system",
           status: "queued",
+          lifecyclePhase: "queued",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: {
             issueId: issue.id,
@@ -6584,6 +6638,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
+              lifecyclePhase: "failed",
               finishedAt: now,
               error: reason,
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
@@ -6908,6 +6963,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: source,
             triggerDetail,
             status: "queued",
+            lifecyclePhase: "queued",
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
@@ -7037,6 +7093,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         invocationSource: source,
         triggerDetail,
         status: "queued",
+        lifecyclePhase: "queued",
         wakeupRequestId: wakeupRequest.id,
         contextSnapshot: enrichedContextSnapshot,
         sessionIdBefore: sessionBefore,
