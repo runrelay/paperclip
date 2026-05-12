@@ -317,8 +317,16 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     return output("completed", `Issue is ${issueStatus}`);
   }
 
-  if (declaredBlocker(input)) {
-    return output("blocked", issueStatus === "blocked" ? "Issue status is blocked" : "Run output declared a concrete blocker", nextAction);
+  if (issueStatus === "blocked") {
+    return output("blocked", "Issue status is blocked", nextAction);
+  }
+
+  if (actionability === "blocked_external") {
+    return output("blocked", "Run output declared a concrete external blocker", nextAction);
+  }
+
+  if (actionability === "approval_required" && !(issueStatus === "in_review" && concreteEvidence)) {
+    return output("blocked", "Run output declared an approval gate", nextAction);
   }
 
   if (!usefulOutput && !concreteEvidence) {
