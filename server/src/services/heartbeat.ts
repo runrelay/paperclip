@@ -4367,8 +4367,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; allowProcessLossRetry?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const allowProcessLossRetry = opts?.allowProcessLossRetry ?? true;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -4447,7 +4448,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           code: "process_lost",
           message: buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined),
         };
-      const shouldRetry = orphanError.code === "process_lost" && tracksLocalChild && hasProcessEvidence && (run.processLossRetryCount ?? 0) < 1;
+      const shouldRetry =
+        allowProcessLossRetry &&
+        orphanError.code === "process_lost" &&
+        tracksLocalChild &&
+        hasProcessEvidence &&
+        (run.processLossRetryCount ?? 0) < 1;
       const baseMessage = orphanError.message;
       const errorCode = orphanError.code;
 
@@ -4522,8 +4528,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reconcileStrandedAssignedIssues() {
-    return recovery.reconcileStrandedAssignedIssues();
+  async function reconcileStrandedAssignedIssues(opts?: {
+    allowExecutionRecovery?: boolean;
+    recoverySource?: "startup" | "periodic" | "manual";
+  }) {
+    return recovery.reconcileStrandedAssignedIssues(opts);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {

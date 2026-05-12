@@ -70,6 +70,11 @@ type RecoveryWakeup = (
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
 
+type StrandedAssignedIssueReconciliationOptions = {
+  allowExecutionRecovery?: boolean;
+  recoverySource?: "startup" | "periodic" | "manual";
+};
+
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot"
@@ -1556,7 +1561,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
-  async function reconcileStrandedAssignedIssues() {
+  async function reconcileStrandedAssignedIssues(opts: StrandedAssignedIssueReconciliationOptions = {}) {
+    const allowExecutionRecovery = opts.allowExecutionRecovery ?? true;
+    const recoverySource = opts.recoverySource ?? "periodic";
     const candidates = await db
       .select()
       .from(issues)
@@ -1575,6 +1582,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       orphanBlockersAssigned: 0,
       escalated: 0,
       skipped: 0,
+      skippedExecutionRecovery: 0,
+      recoverySource,
       issueIds: [] as string[],
     };
 
@@ -1602,6 +1611,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      if (!allowExecutionRecovery) {
+        result.skipped += 1;
+        result.skippedExecutionRecovery += 1;
+        continue;
+      }
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
