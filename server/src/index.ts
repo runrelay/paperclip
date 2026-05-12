@@ -675,11 +675,14 @@ export async function startServer(): Promise<StartedServer> {
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
-      .reapOrphanedRuns()
+      .reapOrphanedRuns({ allowProcessLossRetry: false })
       .then(() => heartbeat.promoteDueScheduledRetries())
       .then(async (promotion) => {
         await heartbeat.resumeQueuedRuns();
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        const reconciled = await heartbeat.reconcileStrandedAssignedIssues({
+          allowExecutionRecovery: false,
+          recoverySource: "startup",
+        });
         if (
           promotion.promoted > 0 ||
           reconciled.assignmentDispatched > 0 ||
