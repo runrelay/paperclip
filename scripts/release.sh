@@ -230,7 +230,9 @@ release_info "  ✓ Versioned workspace to $TARGET_PUBLISH_VERSION"
 release_info ""
 release_info "==> Step 4/7: Building publishable CLI bundle..."
 "$REPO_ROOT/scripts/build-npm.sh" --skip-checks --skip-typecheck
+node "$REPO_ROOT/scripts/release-package-map.mjs" validate-publish-entrypoints
 release_info "  ✓ CLI bundle ready"
+release_info "  ✓ Publish package manifests point at dist artifacts"
 
 VERSIONED_PACKAGE_INFO="$(list_public_package_info)"
 VERSION_IN_CLI_PACKAGE="$(node -e "console.log(require('$CLI_DIR/package.json').version)")"

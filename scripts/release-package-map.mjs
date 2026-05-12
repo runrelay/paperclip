@@ -100,18 +100,47 @@ function replaceWorkspaceDeps(deps, version) {
   return next;
 }
 
+function rewriteSourceEntrypoint(value) {
+  if (typeof value === "string") {
+    if (!value.startsWith("./src/")) return value;
+    return value.replace(/^\.\/src\//, "./dist/").replace(/\.ts$/, ".js");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => rewriteSourceEntrypoint(entry));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, rewriteSourceEntrypoint(entry)]),
+    );
+  }
+
+  return value;
+}
+
+function rewritePublishEntrypoints(pkg) {
+  const next = { ...pkg };
+
+  if (next.main) next.main = rewriteSourceEntrypoint(next.main);
+  if (next.types) next.types = rewriteSourceEntrypoint(next.types);
+  if (next.exports) next.exports = rewriteSourceEntrypoint(next.exports);
+
+  return next;
+}
+
 function setVersion(version) {
   const packages = sortTopologically(discoverPublicPackages());
 
   for (const pkg of packages) {
-    const nextPkg = {
+    const nextPkg = rewritePublishEntrypoints({
       ...pkg.pkg,
       version,
       dependencies: replaceWorkspaceDeps(pkg.pkg.dependencies, version),
       optionalDependencies: replaceWorkspaceDeps(pkg.pkg.optionalDependencies, version),
       peerDependencies: replaceWorkspaceDeps(pkg.pkg.peerDependencies, version),
       devDependencies: replaceWorkspaceDeps(pkg.pkg.devDependencies, version),
-    };
+    });
 
     writeFileSync(pkg.pkgPath, `${JSON.stringify(nextPkg, null, 2)}\n`);
   }
@@ -140,12 +169,72 @@ function listPackages() {
   }
 }
 
+function collectEntrypointStrings(value, strings = []) {
+  if (typeof value === "string") {
+    strings.push(value);
+    return strings;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) collectEntrypointStrings(entry, strings);
+    return strings;
+  }
+
+  if (value && typeof value === "object") {
+    for (const entry of Object.values(value)) collectEntrypointStrings(entry, strings);
+  }
+
+  return strings;
+}
+
+function validatePublishEntrypoints() {
+  const packages = sortTopologically(discoverPublicPackages());
+  const failures = [];
+
+  for (const pkg of packages) {
+    const manifest = readJson(pkg.pkgPath);
+    const dependencySections = [
+      manifest.dependencies ?? {},
+      manifest.optionalDependencies ?? {},
+      manifest.peerDependencies ?? {},
+    ];
+    const entrypoints = collectEntrypointStrings({
+      main: manifest.main,
+      types: manifest.types,
+      exports: manifest.exports,
+    });
+
+    for (const deps of dependencySections) {
+      for (const [name, value] of Object.entries(deps)) {
+        if (name.startsWith("@paperclipai/") && typeof value === "string" && value.startsWith("workspace:")) {
+          failures.push(`${pkg.name}: ${name} still uses ${value}`);
+        }
+      }
+    }
+
+    for (const entrypoint of entrypoints) {
+      if (entrypoint.includes("./src/")) {
+        failures.push(`${pkg.name}: entrypoint still points at source path ${entrypoint}`);
+      }
+      if (entrypoint.endsWith(".ts") && !entrypoint.endsWith(".d.ts")) {
+        failures.push(`${pkg.name}: runtime entrypoint still points at TypeScript file ${entrypoint}`);
+      }
+    }
+  }
+
+  if (failures.length > 0) {
+    process.stderr.write(`${failures.join("\n")}\n`);
+    process.exit(1);
+  }
+}
+
 function usage() {
   process.stderr.write(
     [
       "Usage:",
       "  node scripts/release-package-map.mjs list",
       "  node scripts/release-package-map.mjs set-version <version>",
+      "  node scripts/release-package-map.mjs validate-publish-entrypoints",
       "",
     ].join("\n"),
   );
@@ -164,6 +253,11 @@ if (command === "set-version") {
     process.exit(1);
   }
   setVersion(arg);
+  process.exit(0);
+}
+
+if (command === "validate-publish-entrypoints") {
+  validatePublishEntrypoints();
   process.exit(0);
 }
 
