@@ -182,6 +182,67 @@ describe("run liveness classifier", () => {
     expect(classification.nextAction).toBe("wait for board approval before continuing.");
   });
 
+  it("does not mark comment-only review evidence as blocked just because it mentions pending approval", () => {
+    const latestEvidenceAt = new Date("2026-05-12T22:05:00Z");
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_review",
+        title: "[ObjectiveRun Child] LiteQA-ObjectiveRun for PER_3758 Conservative Dispatcher v0.1",
+        description: "Comment-only ObjectiveRun child; final status should be in_review.",
+      },
+      issueCommentBodies: [
+        "agent_result_v1:\n  verdict: PASS\n  proposed_next_actions:\n    - Review normalized canary output; pending approval from Hermes before promotion.",
+      ],
+      evidence: {
+        issueCommentsCreated: 1,
+        activityEventsCreated: 2,
+        latestEvidenceAt,
+      },
+    });
+
+    expect(classification.livenessState).toBe("advanced");
+    expect(classification.actionability).toBe("approval_required");
+    expect(classification.lastUsefulActionAt).toBe(latestEvidenceAt);
+  });
+
+  it("still treats external credential/access blockers as blocked even when a comment was created", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_review",
+        title: "Investigate production API",
+        description: "Comment-only investigation.",
+      },
+      issueCommentBodies: ["I cannot proceed because I need production credentials and API token access."],
+      evidence: {
+        issueCommentsCreated: 1,
+        latestEvidenceAt: new Date("2026-05-12T22:05:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("blocked");
+    expect(classification.actionability).toBe("blocked_external");
+  });
+
+  it("keeps explicitly blocked issues blocked even when a comment was created", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "blocked",
+        title: "Blocked issue",
+        description: "Explicit blocked status wins.",
+      },
+      issueCommentBodies: ["Comment posted."],
+      evidence: {
+        issueCommentsCreated: 1,
+        latestEvidenceAt: new Date("2026-05-12T22:05:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("blocked");
+  });
+
   it("routes production-sensitive next actions to manager review", () => {
     const classification = classifyRunLiveness({
       ...baseInput,
