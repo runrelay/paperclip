@@ -389,6 +389,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
+    logStore?: string | null;
+    logRef?: string | null;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -442,6 +444,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
+      logStore: input?.logStore ?? null,
+      logRef: input?.logRef ?? null,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
@@ -912,6 +916,93 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+  });
+
+  it("classifies no-log/no-pid external orphans as adapter startup failures without retry", async () => {
+    const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "litellm_proxy",
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+
+    const failedRun = runs[0];
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("adapter_not_started");
+    expect(failedRun?.error).toContain("Adapter/log initialization did not complete");
+    expect(failedRun?.resultJson).toMatchObject({
+      timeoutConfigured: false,
+      timeoutFired: false,
+    });
+    expect(failedRun?.processPid).toBeNull();
+    expect(failedRun?.processGroupId).toBeNull();
+    expect(failedRun?.processStartedAt).toBeNull();
+    expect(failedRun?.logStore).toBeNull();
+    expect(failedRun?.logRef).toBeNull();
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
+    expect(wakeup?.error).toContain("Adapter/log initialization did not complete");
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events).toHaveLength(1);
+    expect(events[0]?.message).toContain("Adapter/log initialization did not complete");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+  });
+
+  it("classifies external orphans with initialized logs as adapter incomplete", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "litellm_proxy",
+      processPid: null,
+      processGroupId: null,
+      logStore: "file",
+      logRef: "heartbeat/test-run.log",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+
+    const failedRun = runs[0];
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("adapter_not_completed");
+    expect(failedRun?.errorCode).not.toBe("process_lost");
+    expect(failedRun?.error).toContain("Adapter initialized logging");
+    expect(failedRun?.resultJson).toMatchObject({
+      timeoutConfigured: false,
+      timeoutFired: false,
+    });
   });
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {

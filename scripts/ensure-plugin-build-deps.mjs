@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { areBuildTargetsFresh, isBuildTargetStale } from "./ensure-plugin-build-deps-lib.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "..");
@@ -11,16 +12,44 @@ const tscCliPath = path.join(rootDir, "node_modules", "typescript", "bin", "tsc"
 const lockDir = path.join(rootDir, "node_modules", ".cache", "paperclip-plugin-build-deps.lock");
 const lockTimeoutMs = 60_000;
 const lockPollMs = 100;
+const rootTsconfig = path.join(rootDir, "tsconfig.base.json");
 
 const buildTargets = [
   {
     name: "@paperclipai/shared",
-    output: path.join(rootDir, "packages/shared/dist/index.js"),
+    outputPaths: [
+      path.join(rootDir, "packages/shared/dist/index.js"),
+      path.join(rootDir, "packages/shared/dist/index.d.ts"),
+    ],
+    inputPaths: [
+      path.join(rootDir, "packages/shared/src"),
+      path.join(rootDir, "packages/shared/package.json"),
+      path.join(rootDir, "packages/shared/tsconfig.json"),
+      rootTsconfig,
+    ],
     tsconfig: path.join(rootDir, "packages/shared/tsconfig.json"),
   },
   {
     name: "@paperclipai/plugin-sdk",
-    output: path.join(rootDir, "packages/plugins/sdk/dist/index.js"),
+    outputPaths: [
+      path.join(rootDir, "packages/plugins/sdk/dist/index.js"),
+      path.join(rootDir, "packages/plugins/sdk/dist/index.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/protocol.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/types.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/testing.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/bundlers.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/dev-server.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/ui/index.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/ui/hooks.d.ts"),
+      path.join(rootDir, "packages/plugins/sdk/dist/ui/types.d.ts"),
+    ],
+    inputPaths: [
+      path.join(rootDir, "packages/plugins/sdk/src"),
+      path.join(rootDir, "packages/plugins/sdk/package.json"),
+      path.join(rootDir, "packages/plugins/sdk/tsconfig.json"),
+      path.join(rootDir, "packages/shared/dist/index.d.ts"),
+      rootTsconfig,
+    ],
     tsconfig: path.join(rootDir, "packages/plugins/sdk/tsconfig.json"),
   },
 ];
@@ -29,12 +58,12 @@ if (!fs.existsSync(tscCliPath)) {
   throw new Error(`TypeScript CLI not found at ${tscCliPath}`);
 }
 
-function allOutputsExist() {
-  return buildTargets.every((target) => fs.existsSync(target.output));
-}
-
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function allTargetsFresh() {
+  return areBuildTargetsFresh(buildTargets);
 }
 
 function waitForLockRelease() {
@@ -43,7 +72,7 @@ function waitForLockRelease() {
     if (!fs.existsSync(lockDir)) {
       return;
     }
-    if (allOutputsExist()) {
+    if (allTargetsFresh()) {
       return;
     }
     sleep(lockPollMs);
@@ -52,7 +81,7 @@ function waitForLockRelease() {
   throw new Error(`Timed out waiting for plugin build dependency lock at ${lockDir}`);
 }
 
-if (allOutputsExist()) {
+if (allTargetsFresh()) {
   process.exit(0);
 }
 
@@ -60,6 +89,7 @@ fs.mkdirSync(path.dirname(lockDir), { recursive: true });
 
 let holdsLock = false;
 let exitCode = 0;
+let rebuiltDependency = false;
 try {
   try {
     fs.mkdirSync(lockDir);
@@ -67,8 +97,8 @@ try {
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
       waitForLockRelease();
-      if (!allOutputsExist()) {
-        throw new Error("Plugin build dependency lock released before all outputs were created");
+      if (!allTargetsFresh()) {
+        throw new Error("Plugin build dependency lock released before build outputs became fresh");
       }
       process.exit(0);
     }
@@ -76,7 +106,7 @@ try {
   }
 
   for (const target of buildTargets) {
-    if (fs.existsSync(target.output)) {
+    if (!rebuiltDependency && !isBuildTargetStale(target)) {
       continue;
     }
 
@@ -93,6 +123,8 @@ try {
       exitCode = result.status ?? 1;
       break;
     }
+
+    rebuiltDependency = true;
   }
 } finally {
   if (holdsLock) {
@@ -102,4 +134,8 @@ try {
 
 if (exitCode !== 0) {
   process.exit(exitCode);
+}
+
+if (!allTargetsFresh()) {
+  throw new Error("Plugin build dependency outputs are still stale after rebuild");
 }
